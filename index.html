@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Predict a RF signal for Athom Homey</title>
+    <title>RF signal analyzer for Athom Homey</title>
     <style type="text/css">
 
         * {
@@ -397,18 +397,15 @@
                 for (var predictedWordLength = minWordLength; predictedWordLength <= maxWordLength; predictedWordLength++) {
                     for (var sofl = minSofl; sofl <= maxSofl; sofl++) {
                         for (var eofl = minEofl; eofl <= maxEofl; eofl++) {
-                            if (sofl == 0 || eofl == 0) {
+                            // predict signal definition
+                            var current = signalDef(recordData, sofl, eofl, predictedSignalCount, predictedSignalLength, predictedWordLength, predictedWords, tolerance, maxWords);
+                            if (current) {
+                                // analyze definition
+                                current.predictions = analyze(current);
 
-                                // predict signal defenition
-                                var current = signalDef(recordData, sofl, eofl, predictedSignalCount, predictedSignalLength, predictedWordLength, predictedWords, tolerance, maxWords);
-                                if (current) {
-                                    // analyze defenition
-                                    current.predictions = analyze(current);
-
-                                    // include in results?
-                                    if (current.predictions && current.predictions.match && current.predictions.score) {
-                                        results.push(current);
-                                    }
+                                // include in results?
+                                if (current.predictions && current.predictions.match && current.predictions.score) {
+                                    results.push(current);
                                 }
                             }
                         }
@@ -433,9 +430,12 @@
                 if (trigger != $predictedSignalLength) $predictedSignalLength.value = results[0].predictedSignalLength;
                 //if (trigger != $predictedWords) $predictedWords.value = JSON.stringify(result.predictedWords);
 
+                // calculate final signal definition
+                var refinedDef = getSignalDef(results);
+
                 // output
-                $output.innerHTML = '<strong>Signal: </strong>' + syntaxHighlight(results[0].signal)
-                    + '\n\n<strong>Payload: </strong>' + results[0].predictions.guess
+                $output.innerHTML = '<strong>Signal: </strong>' + syntaxHighlight(refinedDef.signal)
+                    + '\n\n<strong>Payload: </strong>' + refinedDef.predictions.guess
                     + '\n<strong>Match: </strong> &nbsp;' + Math.round(results[0].predictions.match * 100) + '%';
                 $output.style.outline = '1px solid #ccc';
 
@@ -485,7 +485,7 @@
             return dist;
         }
 
-        // Generate signal def based on: https://github.com/athombv/node-homey-433/wiki/How-to-record-a-signal#defining-the-eof-end-of-frame
+        // Generate signal def based on: https://github.com/athombv/node-homey-433/wiki/How-to-record-a-signal
         function signalDef(recordData, sofl = 1, eofl = 0, predictedSignalCount = 0, predictedSignalLength = 0, predictedWordLength = 2, predictedWords = null, tolerance = 100, maxWords = -1) {
 
             // filter noise & select most common signal
@@ -545,18 +545,15 @@
                         // grab next signal part
                         var part = predictedSignal.slice(i, i + predictedWordLength);
 
-                        // done if signal repeats, with a minimal of 2 predicted words
-                        if (predictedWords.length < 2 ? false : predictedWords.find(word => calcDist(part, word, tolerance) !== -1) !== undefined)
-                            break;
+                        // add word if it does not match any of the previous detected words
+                        if (!predictedWords.find(word => calcDist(part, word, tolerance) !== -1))
+                            predictedWords.push(part);  // add part to predicted words
 
-                        // add part to predicted words
-                        predictedWords.push(part);
+                        // reached the max number of words?
+                        if (predictedWords.length == maxWords)
+                            break;
                     }
                 }
-            }
-
-            if (maxWords && (predictedWords || []).length > maxWords) {
-                predictedWords = predictedWords.slice(0, maxWords);
             }
 
             // find words
@@ -585,7 +582,7 @@
             var length = Math.floor((predictedSignal.length - sofl - eofl) / predictedWordLength);
 
             // define signal
-            var signal = { sof, eof, words, interval: 10000, sensitivity: 0.7, repetitions: 20, minimalLength: length, maximalLength: length };
+            var signal = { sof, eof, words, interval: 10000, sensitivity: 0.5, repetitions: 20, minimalLength: length, maximalLength: length };
             return { recordData, predictedSignalCount, predictedSignalLength, sofl, eofl, counts, max, closest, signals, sof, eof, predictedWordLength, predictedWords, predictedSignal, tolerance, words, length, signal };
         }
 
@@ -615,15 +612,15 @@
                 output.match = .5 * (output.payloadMatch + output.signalsMatch);
                 output.score = (100 * output.payloadMatch)  // number of unknown parts
                     + (100 * output.signalsMatch)           // number of signal machtes
-                    + (signalDef.sof.length ? Math.max(0, 30 - 3*signalDef.sof.length) : 0)       // prefer signals with small sof (> 0)
-                    + (signalDef.eof.length ? Math.max(0, 30 - 3*signalDef.sof.length) : 0)       // prefer signals with small eof (> 0)
+                    + (signalDef.sof.length ? Math.max(0, 100 - 5 * signalDef.sof.length) : 0)       // prefer signals with small sof (> 0)
+                    + (signalDef.eof.length ? Math.max(0, 100 - 5 * signalDef.eof.length) : 0)       // prefer signals with small eof (> 0)
                     + Math.max(0, (200 - (20 * signalDef.words.length)))     // prefer less words
                     + Math.max(0, (200 - (20 * signalDef.words[0].length))); // prefer shorter words
             }
             return output;
         }
 
-        // parse signal payload (digital representation) using the provided signal defenition
+        // parse signal payload (digital representation) using the provided signal definition
         function parseSignal(signal, signalDef) {
             if (!Array.isArray(signal) || !signalDef || !signalDef.words || !signalDef.words.length)
                 return null;
@@ -650,6 +647,29 @@
             }
             return payload;
         }
+
+
+        // Refine the result by re-calcuting the signal def from matched lines only
+        function getSignalDef(results) {
+
+            var best = results[0];
+            if (!best || best.predictions.signalsMatch === 1)
+                return best;
+
+            // remove non-matched lines (remove outliers)
+            var filteredData = best.recordData.filter((line, idx) => line.length == best.predictedSignalLength && parseSignal(line, best).join('') === best.predictions.guess);
+
+            // re-calculate signal def from filtered data
+            var signal = signalDef(filteredData, best.sofl, best.eofl, best.predictedSignalCount, best.predictedSignalLength, best.predictedWordLength, best.predictedWords, best.tolerance, best.maxWords);
+
+            // re-analyze definition
+            if (signal) {
+                signal.predictions = analyze(signal);
+            }
+
+            return signal || best;
+        }
+
 
         function displayPayloads(results) {
             $payloads.innerHTML = '';
@@ -767,9 +787,10 @@
             </div>
         </div>
         <div class="section">
-            <h3>Predicted Signal (best match)</h3>
-            <p>See console output for details & intermediate results.</p>
+            <h3>Predicted Signal</h3>
+            <p>The <i>Signal</i> is calculated from the best match (see predictions below), by filtering non-matching signals from the record data.</p>
             <pre id="output"></pre>
+            <p><i>See console output for details & intermediate results.</i></p>
         </div>
         <div class="section">
             <h3>Predictions</h3>
